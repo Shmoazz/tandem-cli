@@ -29,6 +29,8 @@ NO_SESSION = ("No API key and no app.tandemai.io tab in Chrome: "
 NO_PROGRAM = "No program id: pass -p PROGRAM_UUID or set TANDEM_PROGRAM."
 NOTHING_TO_UPDATE = ("Nothing to update: pass at least one of "
                      "--name/--statement/--status/--owner/--parent.")
+NO_PARENT = "Parent %r not found in table %s"
+NO_REQUIREMENT = "No requirement %r in table %s"
 
 
 def tables_path(program):
@@ -47,6 +49,13 @@ def normalize_status(value, unknown):
 
 def requirement_ids(rows):
     return {r["number"]: r["id"] for r in rows}
+
+
+def parent_id_of(parent, ids, table_name):
+    parent_id = ids.get(parent)
+    if not parent_id:
+        sys.exit(NO_PARENT % (parent, table_name))
+    return parent_id
 
 
 def choose_table(tables, ref):
@@ -80,10 +89,7 @@ def add_body(number, name, statement, status, owner, parent, existing, table_nam
     if owner:
         body["owner"] = owner
     if parent:
-        parent_id = existing.get(parent)
-        if not parent_id:
-            sys.exit("Parent %r not found in table %s" % (parent, table_name))
-        body["parent_id"] = parent_id
+        body["parent_id"] = parent_id_of(parent, existing, table_name)
     return body
 
 
@@ -103,10 +109,7 @@ def update_body(name, statement, status, owner, parent, rows, table_name):
         if parent.lower() == "none":
             body["parent_id"] = None
         else:
-            parent_id = requirement_ids(rows).get(parent)
-            if not parent_id:
-                sys.exit("Parent %r not found in table %s" % (parent, table_name))
-            body["parent_id"] = parent_id
+            body["parent_id"] = parent_id_of(parent, requirement_ids(rows), table_name)
     if not body:
         sys.exit(NOTHING_TO_UPDATE)
     return body
@@ -328,7 +331,7 @@ def main():
         rows = api("GET", reqs_path, auth)
         row = next((r for r in rows if r["number"] == args.number), None)
         if not row:
-            sys.exit("No requirement %r in table %s" % (args.number, table["name"]))
+            sys.exit(NO_REQUIREMENT % (args.number, table["name"]))
         body = update_body(args.name, args.statement, args.status, args.owner,
                            args.parent, rows, table["name"])
         api("PUT", reqs_path + "/" + row["id"], auth, body)
@@ -359,7 +362,7 @@ def main():
     if args.cmd == "rm":
         req_id = requirement_ids(api("GET", reqs_path, auth)).get(args.number)
         if not req_id:
-            sys.exit("No requirement %r in table %s" % (args.number, table["name"]))
+            sys.exit(NO_REQUIREMENT % (args.number, table["name"]))
         api("DELETE", reqs_path + "/" + req_id, auth, {"deletion_reason": args.reason})
         print("deleted %s" % args.number)
         return
