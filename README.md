@@ -53,6 +53,16 @@ tandem rm MT-TQ-01 -t "Motor Requirements" --reason "duplicate"
 
 Base `https://app.tandemai.io/api/v1`. Requirements live at `/programs/{p}/req-tables/{t}/requirements[/{id}]`: create is POST, list is GET, update is PUT (PATCH returns 405; PUT accepts a partial body and can renumber and re-parent through `number` and `parent_id`), delete is DELETE with `{"deletion_reason": "..."}`. Status values are lowercase (`draft`, `review`, `approved`, `rejected`). The hierarchy is `parent_id`, never inferred from numbering. Linking a verification artifact to a requirement (`/requirements/{id}/artifacts/from-node-artifact`) fails with "Requirement does not belong to this program" because rows come back with a null `program_id`; the web app can make that link, the API cannot, as of August 2026.
 
+## Check
+
+```
+./check.sh
+```
+
+Byte-compiles `tandem` and runs `tandem_test.py`, which covers the decisions the
+CLI makes before it talks to anything: which auth, which program, which table, and
+what body each command sends. Standard library unittest, no network, under a second.
+
 ## License
 
 MIT.
