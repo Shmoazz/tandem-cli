@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""tandem: a tiny command line client for Tandem (app.tandemai.io) requirements.
+
+Auth, in order of preference:
+  1. TANDEM_API_KEY in the environment, or the first line of ~/.config/tandem/api_key
+     (create a key in Tandem under Settings > Integrations > API Keys).
+  2. On macOS only, a logged-in app.tandemai.io tab in Google Chrome
+     (requires View > Developer > Allow JavaScript from Apple Events).
+
+Program: -p PROGRAM_UUID, or TANDEM_PROGRAM in the environment, or the program
+open in the Chrome tab; with an API key and a single program it is picked for you.
+
+Commands:
+  tandem programs                        list programs you can see
+  tandem tables                          list requirement tables
+  tandem ls [-t TABLE]                   list requirements in a table
+  tandem add -t TABLE -n NUM --name .. --statement .. [--status draft]
+             [--owner EMAIL] [--parent NUM]
+  tandem update NUM [-t TABLE] [--name ..] [--statement ..] [--status ..]
+             [--owner ..] [--parent NUM|none]
+  tandem import FILE.csv -t TABLE        bulk create from CSV
+                                         (cols: Number,Name,Statement,Status,Owner,Parent)
+  tandem rm NUM -t TABLE --reason "..."  delete a requirement
+
+TABLE may be a table name or UUID. Standard library only, Python 3.9+.
+"""
+import argparse
+import csv
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+BASE = "https://app.tandemai.io/api/v1"
+
+COGNITO = "https://cognito-idp.us-east-1.amazonaws.com/"
+
+# Pull the long-lived refresh token + client id + current program from the tab.
+# The idToken in localStorage expires hourly, so we don't trust it, so we mint a
+# fresh one from the refresh token (valid for weeks) on every run.
+GRAB_JS = r"""
+(function(){
+  var prog=localStorage.getItem('tandem_current_program_id');
+  var cid=null, rt=null;
+  for(var i=0;i<localStorage.length;i++){
+    var k=localStorage.key(i);
+    var m=k.match(/CognitoIdentityServiceProvider\.([^.]+)\./);
+    if(m) cid=m[1];
+    if(/\.refreshToken$/.test(k)) rt=localStorage.getItem(k);
+  }
+  return JSON.stringify({clientId:cid, refresh:rt, program:prog});
+})()
+"""
+
+def chrome_grab():
+    script = '''
+tell application "Google Chrome"
+  repeat with w in windows
+    repeat with t in tabs of w
+      if (URL of t) contains "app.tandemai.io" then
+        return execute t javascript "%s"
+      end if
+    end repeat
+  end repeat
+end tell
+return ""
+''' % GRAB_JS.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+    out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit("Could not talk to Chrome: %s" % out.stderr.strip())
+    body = out.stdout.strip()
+    if not body:
+        sys.exit("No API key and no app.tandemai.io tab in Chrome: set TANDEM_API_KEY or open Tandem and log in.")
+    data = json.loads(body)
+    if not data.get("refresh") or not data.get("clientId"):
+        sys.exit("Tandem tab found but no session: are you logged in?")
+    return data["clientId"], data["refresh"], data.get("program")
+
+def mint_token(client_id, refresh):
+    body = json.dumps({"AuthFlow": "REFRESH_TOKEN_AUTH", "ClientId": client_id,
+                       "AuthParameters": {"REFRESH_TOKEN": refresh}}).encode()
+    req = urllib.request.Request(COGNITO, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-amz-json-1.1")
+    req.add_header("X-Amz-Target", "AWSCognitoIdentityProviderService.InitiateAuth")
+    try:
+        with urllib.request.urlopen(req) as r:
+            tok = json.load(r).get("AuthenticationResult", {}).get("IdToken")
+    except urllib.error.HTTPError as e:
+        sys.exit("Token refresh failed: %s" % e.read().decode()[:300])
+    if not tok:
+        sys.exit("Token refresh returned no IdToken.")
+    return tok
+
+class Auth:
+    """Either an API key (X-API-Key) or a Cognito id token (Bearer)."""
+    def __init__(self, api_key=None, token=None):
+        self.api_key, self.token = api_key, token
+
+    def apply(self, req):
+        if self.api_key:
+            req.add_header("X-API-Key", self.api_key)
+        else:
+            req.add_header("Authorization", "Bearer " + self.token)
+
+
+def api_key_from_env():
+    key = os.environ.get("TANDEM_API_KEY", "").strip()
+    if key:
+        return key
+    path = os.path.expanduser("~/.config/tandem/api_key")
+    if os.path.exists(path):
+        with open(path) as f:
+            return f.readline().strip()
+    return None
+
+
+def api(method, path, token, body=None):
+    req = urllib.request.Request(BASE + path, method=method)
+    token.apply(req)
+    req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) tandem-cli")
+    data = None
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+        data = json.dumps(body).encode()
+    try:
+        with urllib.request.urlopen(req, data) as r:
+            txt = r.read().decode()
+    except urllib.error.HTTPError as e:
+        sys.exit("API %s %s -> %d: %s" % (method, path, e.code, e.read().decode()[:300]))
+    return json.loads(txt) if txt else None
+
+def resolve_table(token, program, ref):
+    tables = api("GET", "/programs/%s/req-tables" % program, token)
+    if ref:
+        for t in tables:
+            if t["id"] == ref or t["name"].lower() == ref.lower():
+                return t
+        sys.exit("No table named %r. Tables: %s" % (ref, ", ".join(t["name"] for t in tables)))
+    if len(tables) == 1:
+        return tables[0]
+    sys.exit("Multiple tables, pick one with -t: %s" % ", ".join(t["name"] for t in tables))
+
+NORM_STATUS = {"draft": "draft", "in review": "review", "review": "review",
+               "approved": "approved", "rejected": "rejected"}
+
+def main():
+    ap = argparse.ArgumentParser(prog="tandem")
+    ap.add_argument("-p", "--program", help="program UUID (default: current Chrome tab)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("programs")
+    sub.add_parser("tables")
+    p_ls = sub.add_parser("ls"); p_ls.add_argument("-t", "--table")
+    p_add = sub.add_parser("add")
+    p_add.add_argument("-t", "--table")
+    p_add.add_argument("-n", "--number", required=True)
+    p_add.add_argument("--name", required=True)
+    p_add.add_argument("--statement", required=True)
+    p_add.add_argument("--status", default="draft")
+    p_add.add_argument("--owner", default=os.environ.get("TANDEM_OWNER", ""))
+    p_add.add_argument("--parent")
+    p_imp = sub.add_parser("import")
+    p_imp.add_argument("file")
+    p_imp.add_argument("-t", "--table")
+    p_imp.add_argument("--owner", default=os.environ.get("TANDEM_OWNER", ""))
+    p_rm = sub.add_parser("rm")
+    p_rm.add_argument("number")
+    p_rm.add_argument("-t", "--table")
+    p_rm.add_argument("--reason", required=True)
+    p_up = sub.add_parser("update")
+    p_up.add_argument("number")
+    p_up.add_argument("-t", "--table")
+    p_up.add_argument("--name")
+    p_up.add_argument("--statement")
+    p_up.add_argument("--status")
+    p_up.add_argument("--owner")
+    p_up.add_argument("--parent", help="parent requirement NUMBER, or 'none' to unparent")
+    args = ap.parse_args()
+
+    key = api_key_from_env()
+    tab_program = None
+    if key:
+        token = Auth(api_key=key)
+    else:
+        client_id, refresh, tab_program = chrome_grab()
+        token = Auth(token=mint_token(client_id, refresh))
+
+    if args.cmd == "programs":
+        for p in api("GET", "/programs", token) or []:
+            print("%s  %s" % (p.get("id"), p.get("name")))
+        return
+
+    program = args.program or os.environ.get("TANDEM_PROGRAM") or tab_program
+    if not program and key:
+        programs = api("GET", "/programs", token) or []
+        if len(programs) == 1:
+            program = programs[0]["id"]
+        else:
+            sys.exit("Pick a program with -p or TANDEM_PROGRAM: "
+                     + ", ".join("%s (%s)" % (p.get("name"), p.get("id")) for p in programs))
+    if not program:
+        sys.exit("No program id: pass -p PROGRAM_UUID or set TANDEM_PROGRAM.")
+
+    if args.cmd == "tables":
+        for t in api("GET", "/programs/%s/req-tables" % program, token):
+            print("%s  %s  (%s)" % (t["id"], t["name"], t.get("description") or ""))
+        return
+
+    table = resolve_table(token, program, args.table)
+    reqs_path = "/programs/%s/req-tables/%s/requirements" % (program, table["id"])
+
+    if args.cmd == "ls":
+        rows = api("GET", reqs_path, token)
+        rows.sort(key=lambda r: (r.get("level", 0), r.get("sort_order", 0)))
+        for r in rows:
+            indent = "  " * r.get("level", 0)
+            print("%-16s %-10s %s%s: %s" % (r["number"], r["status"], indent, r["name"], (r.get("statement") or "")[:70]))
+        return
+
+    if args.cmd == "add":
+        existing = {r["number"]: r["id"] for r in api("GET", reqs_path, token)}
+        body = {"number": args.number, "name": args.name, "statement": args.statement,
+                "status": NORM_STATUS.get(args.status.lower(), "draft")}
+        if args.owner:
+            body["owner"] = args.owner
+        if args.parent:
+            pid = existing.get(args.parent)
+            if not pid:
+                sys.exit("Parent %r not found in table %s" % (args.parent, table["name"]))
+            body["parent_id"] = pid
+        r = api("POST", reqs_path, token, body)
+        print("created %s (%s)" % (r["number"], r["id"]))
+        return
+
+    if args.cmd == "update":
+        rows = api("GET", reqs_path, token)
+        row = next((r for r in rows if r["number"] == args.number), None)
+        if not row:
+            sys.exit("No requirement %r in table %s" % (args.number, table["name"]))
+        body = {}
+        if args.name is not None: body["name"] = args.name
+        if args.statement is not None: body["statement"] = args.statement
+        if args.status is not None: body["status"] = NORM_STATUS.get(args.status.lower(), args.status)
+        if args.owner is not None: body["owner"] = args.owner
+        if args.parent is not None:
+            if args.parent.lower() == "none":
+                body["parent_id"] = None
+            else:
+                pid = next((r["id"] for r in rows if r["number"] == args.parent), None)
+                if not pid:
+                    sys.exit("Parent %r not found in table %s" % (args.parent, table["name"]))
+                body["parent_id"] = pid
+        if not body:
+            sys.exit("Nothing to update: pass at least one of --name/--statement/--status/--owner/--parent.")
+        api("PUT", reqs_path + "/" + row["id"], token, body)
+        print("updated %s (%s)" % (args.number, ", ".join(body.keys())))
+        return
+
+    if args.cmd == "import":
+        existing = {r["number"]: r["id"] for r in api("GET", reqs_path, token)}
+        made, skipped = 0, 0
+        with open(args.file, newline="") as f:
+            for row in csv.DictReader(f):
+                num = (row.get("Number") or "").strip()
+                if not num:
+                    continue
+                if num in existing:
+                    print("skip %s (already exists)" % num); skipped += 1; continue
+                body = {"number": num,
+                        "name": (row.get("Name") or "").strip(),
+                        "statement": (row.get("Statement") or "").strip(),
+                        "status": NORM_STATUS.get((row.get("Status") or "draft").strip().lower(), "draft"),
+                        "owner": (row.get("Owner") or args.owner).strip()}
+                if not body["owner"]:
+                    body.pop("owner")
+                parent = (row.get("Parent") or "").strip()
+                if parent:
+                    if parent in existing:
+                        body["parent_id"] = existing[parent]
+                    else:
+                        print("warn: parent %s of %s not found; creating at top level" % (parent, num))
+                r = api("POST", reqs_path, token, body)
+                existing[num] = r["id"]
+                made += 1
+                print("created %s" % num)
+        print("done: %d created, %d skipped" % (made, skipped))
+        return
+
+    if args.cmd == "rm":
+        existing = {r["number"]: r["id"] for r in api("GET", reqs_path, token)}
+        rid = existing.get(args.number)
+        if not rid:
+            sys.exit("No requirement %r in table %s" % (args.number, table["name"]))
+        api("DELETE", reqs_path + "/" + rid, token, {"deletion_reason": args.reason})
+        print("deleted %s" % args.number)
+        return
+
+if __name__ == "__main__":
+    main()
