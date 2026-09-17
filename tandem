@@ -1,28 +1,13 @@
 #!/usr/bin/env python3
-"""tandem: a tiny command line client for Tandem (app.tandemai.io) requirements.
+"""tandem: a one-file command line client for Tandem (app.tandemai.io) requirements.
 
-Auth, in order of preference:
-  1. TANDEM_API_KEY in the environment, or the first line of ~/.config/tandem/api_key
-     (create a key in Tandem under Settings > Integrations > API Keys).
-  2. On macOS only, a logged-in app.tandemai.io tab in Google Chrome
-     (requires View > Developer > Allow JavaScript from Apple Events).
+One file, standard library only, Python 3.9+, because the install promise is a curl
+and a chmod; this gets structured internally, never split into modules.
 
-Program: -p PROGRAM_UUID, or TANDEM_PROGRAM in the environment, or the program
-open in the Chrome tab; with an API key and a single program it is picked for you.
-
-Commands:
-  tandem programs                        list programs you can see
-  tandem tables                          list requirement tables
-  tandem ls [-t TABLE]                   list requirements in a table
-  tandem add -t TABLE -n NUM --name .. --statement .. [--status draft]
-             [--owner EMAIL] [--parent NUM]
-  tandem update NUM [-t TABLE] [--name ..] [--statement ..] [--status ..]
-             [--owner ..] [--parent NUM|none]
-  tandem import FILE.csv -t TABLE        bulk create from CSV
-                                         (cols: Number,Name,Statement,Status,Owner,Parent)
-  tandem rm NUM -t TABLE --reason "..."  delete a requirement
-
-TABLE may be a table name or UUID. Standard library only, Python 3.9+.
+A borrowed Chrome session's id token expires hourly, so that path mints a fresh one
+from the refresh token on every run and never trusts the one in the page.
+Cloudflare 1010s the default urllib User-Agent, so every request carries USER_AGENT.
+Commands, auth setup and the API notes live in README.md.
 """
 import argparse
 import csv
@@ -34,8 +19,14 @@ import urllib.error
 import urllib.request
 
 BASE = "https://app.tandemai.io/api/v1"
-
 COGNITO = "https://cognito-idp.us-east-1.amazonaws.com/"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) tandem-cli"
+KEY_FILE = "~/.config/tandem/api_key"
+STATUS_WORDS = {"draft": "draft", "in review": "review", "review": "review",
+                "approved": "approved", "rejected": "rejected"}
+NO_SESSION = ("No API key and no app.tandemai.io tab in Chrome: "
+              "set TANDEM_API_KEY or open Tandem and log in.")
+NO_PROGRAM = "No program id: pass -p PROGRAM_UUID or set TANDEM_PROGRAM."
 
 # Pull the long-lived refresh token + client id + current program from the tab.
 # The idToken in localStorage expires hourly, so we don't trust it, so we mint a
@@ -72,7 +63,7 @@ return ""
         sys.exit("Could not talk to Chrome: %s" % out.stderr.strip())
     body = out.stdout.strip()
     if not body:
-        sys.exit("No API key and no app.tandemai.io tab in Chrome: set TANDEM_API_KEY or open Tandem and log in.")
+        sys.exit(NO_SESSION)
     data = json.loads(body)
     if not data.get("refresh") or not data.get("clientId"):
         sys.exit("Tandem tab found but no session: are you logged in?")
@@ -109,7 +100,7 @@ def api_key_from_env():
     key = os.environ.get("TANDEM_API_KEY", "").strip()
     if key:
         return key
-    path = os.path.expanduser("~/.config/tandem/api_key")
+    path = os.path.expanduser(KEY_FILE)
     if os.path.exists(path):
         with open(path) as f:
             return f.readline().strip()
@@ -119,7 +110,7 @@ def api_key_from_env():
 def api(method, path, token, body=None):
     req = urllib.request.Request(BASE + path, method=method)
     token.apply(req)
-    req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) tandem-cli")
+    req.add_header("User-Agent", USER_AGENT)
     data = None
     if body is not None:
         req.add_header("Content-Type", "application/json")
@@ -141,9 +132,6 @@ def resolve_table(token, program, ref):
     if len(tables) == 1:
         return tables[0]
     sys.exit("Multiple tables, pick one with -t: %s" % ", ".join(t["name"] for t in tables))
-
-NORM_STATUS = {"draft": "draft", "in review": "review", "review": "review",
-               "approved": "approved", "rejected": "rejected"}
 
 def main():
     ap = argparse.ArgumentParser(prog="tandem")
@@ -200,7 +188,7 @@ def main():
             sys.exit("Pick a program with -p or TANDEM_PROGRAM: "
                      + ", ".join("%s (%s)" % (p.get("name"), p.get("id")) for p in programs))
     if not program:
-        sys.exit("No program id: pass -p PROGRAM_UUID or set TANDEM_PROGRAM.")
+        sys.exit(NO_PROGRAM)
 
     if args.cmd == "tables":
         for t in api("GET", "/programs/%s/req-tables" % program, token):
@@ -221,7 +209,7 @@ def main():
     if args.cmd == "add":
         existing = {r["number"]: r["id"] for r in api("GET", reqs_path, token)}
         body = {"number": args.number, "name": args.name, "statement": args.statement,
-                "status": NORM_STATUS.get(args.status.lower(), "draft")}
+                "status": STATUS_WORDS.get(args.status.lower(), "draft")}
         if args.owner:
             body["owner"] = args.owner
         if args.parent:
@@ -241,7 +229,7 @@ def main():
         body = {}
         if args.name is not None: body["name"] = args.name
         if args.statement is not None: body["statement"] = args.statement
-        if args.status is not None: body["status"] = NORM_STATUS.get(args.status.lower(), args.status)
+        if args.status is not None: body["status"] = STATUS_WORDS.get(args.status.lower(), args.status)
         if args.owner is not None: body["owner"] = args.owner
         if args.parent is not None:
             if args.parent.lower() == "none":
@@ -270,7 +258,7 @@ def main():
                 body = {"number": num,
                         "name": (row.get("Name") or "").strip(),
                         "statement": (row.get("Statement") or "").strip(),
-                        "status": NORM_STATUS.get((row.get("Status") or "draft").strip().lower(), "draft"),
+                        "status": STATUS_WORDS.get((row.get("Status") or "draft").strip().lower(), "draft"),
                         "owner": (row.get("Owner") or args.owner).strip()}
                 if not body["owner"]:
                     body.pop("owner")
